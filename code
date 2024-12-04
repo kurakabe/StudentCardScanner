@@ -1,0 +1,265 @@
+import cv2
+import numpy as np
+import re
+import time
+import pyzbar.pyzbar as qr
+import RPi.GPIO as GPIO
+from mfrc522 import SimpleMFRC522
+import threading
+
+# Student manager for handling QR code-based students
+class StudentManager:
+    def __init__(self, student_file="students.txt"):
+        self.student_file = student_file
+        self.student_dict = self.load_students()
+        self.students_in_class = []
+
+    def load_students(self):
+        student_dict = {}
+        with open(self.student_file, "r") as f:
+            for line in f:
+                student_info = line.strip().split(", ")
+                if len(student_info) == 2:
+                    student_dict[student_info[1]] = student_info[0]
+        return student_dict
+
+    def save_student(self, student_name, student_code):
+        with open(self.student_file, "a") as student_file:
+            student_file.write(f"\n{student_name}, {student_code}")
+        self.student_dict[student_code] = student_name
+
+    def mark_student_in_class(self, student_code):
+        if student_code not in self.students_in_class:
+            self.students_in_class.append(student_code)
+            print(f"Student {self.student_dict.get(student_code, 'Unknown')} marked in class.")
+
+    def mark_student_out_class(self, student_code):
+        if student_code in self.students_in_class:
+            self.students_in_class.remove(student_code)
+            print(f"Student {self.student_dict.get(student_code, 'Unknown')} marked out of class.")
+
+    def is_student_in_class(self, student_code):
+        return student_code in self.students_in_class
+
+    def get_student_name(self, student_code):
+        return self.student_dict.get(student_code, None)
+
+    def check_students_in_class(self):
+        print("Students in class (QR):")
+        if len(self.students_in_class) == 0:
+            print("No students in class.")
+        else:
+            for student_code in self.students_in_class:
+                student_name = self.get_student_name(student_code)
+                print(f" - {student_name} ({student_code})")
+
+
+# Student manager for handling RFID-based students
+class StudentManagerRFID:
+    def __init__(self, student_file="studentsRFID.txt"):
+        self.student_file = student_file
+        self.student_dict = self.load_students()
+        self.students_in_class = []
+
+    def load_students(self):
+        student_dict = {}
+        with open(self.student_file, "r") as f:
+            for line in f:
+                student_info = line.strip().split(", ")
+                if len(student_info) == 2:
+                    student_dict[student_info[1]] = student_info[0]
+        return student_dict
+
+    def save_student(self, student_name, student_code):
+        with open(self.student_file, "a") as student_file:
+            student_file.write(f"\n{student_name}, {student_code}")
+        self.student_dict[student_code] = student_name
+
+    def mark_student_in_class(self, student_code):
+        if student_code not in self.students_in_class:
+            self.students_in_class.append(student_code)
+            print(f"Student {self.student_dict.get(student_code, 'Unknown')} marked in class.")
+
+    def mark_student_out_class(self, student_code):
+        if student_code in self.students_in_class:
+            self.students_in_class.remove(student_code)
+            print(f"Student {self.student_dict.get(student_code, 'Unknown')} marked out of class.")
+
+    def is_student_in_class(self, student_code):
+        return student_code in self.students_in_class
+
+    def get_student_name(self, student_code):
+        return self.student_dict.get(student_code, None)
+
+    def check_students_in_class(self):
+        print("Students in class (RFID):")
+        if len(self.students_in_class) == 0:
+            print("No students in class.")
+        else:
+            for student_code in self.students_in_class:
+                student_name = self.get_student_name(student_code)
+                print(f" - {student_name} ({student_code})")
+
+
+# QR Scanner class to handle QR code scanning
+class QrScanner:
+    def __init__(self, student_manager):
+        self.cap = None
+        self.font = cv2.FONT_HERSHEY_PLAIN
+        self.student_manager = student_manager
+        self.scanning = False
+
+    def start_camera(self):
+        """Reinitialize the camera"""
+        if self.cap is not None:
+            self.cap.release()
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            print("Error: Unable to access the camera.")
+            return False
+        return True
+
+    def scan(self):
+        print("Starting QR code scan... Press 'q' to stop.")
+        self.scanning = True
+
+        # Initialize camera
+        if not self.start_camera():
+            return  # Exit if the camera can't be accessed
+
+        while self.scanning:
+            ret, frame = self.cap.read()
+            if not ret:
+                print("Failed to grab frame.")
+                break  # Stop if we can't read the frame
+
+            flipped = cv2.flip(frame, flipCode=1)
+            frame_resized = cv2.resize(flipped, (600, 500))
+            qr_detect = qr.decode(frame_resized)
+
+            in_class = False
+            for qr_data in qr_detect:
+                student_code = self.extract_student_code(qr_data.data)
+                if student_code:
+                    self.process_qr_scan(student_code)
+                    self.scanning = False  # Stop scanning once a card is processed
+
+                self.draw_qr_rectangle(frame_resized, qr_data)
+                cv2.putText(frame_resized, str(qr_data.data), (20, 20), self.font, 2, (255, 0, 0), 2)
+
+            cv2.imshow("QR Scanner - Press 'q' to exit", frame_resized)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                self.scanning = False
+                cv2.destroyAllWindows()  # Ensure all windows are closed
+                print("QR scanning stopped.")
+                break
+            time.sleep(0.1)  # Reduce unnecessary delay between frames
+
+        # Ensure we release the capture when the scan ends
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+    def extract_student_code(self, data):
+        match = re.search(r"\d{6}(\d{7})\d+", str(data))
+        if match:
+            return match.group(1)
+        return None
+
+    def process_qr_scan(self, student_code):
+        student_name = self.student_manager.get_student_name(student_code)
+
+        if student_name and not self.student_manager.is_student_in_class(student_code):
+            print(f"Student: {student_name} is in the class.")
+            self.student_manager.mark_student_in_class(student_code)
+        elif student_name and self.student_manager.is_student_in_class(student_code):
+            print(f"Student: {student_name} is out of the class.")
+            self.student_manager.mark_student_out_class(student_code)
+        elif not student_name:
+            self.handle_new_student(student_code)
+
+    def handle_new_student(self, student_code):
+        student_name = input(f"Enter student full name for code {student_code} (Name Surname): ")
+        self.student_manager.save_student(student_name, student_code)
+        print(f"New student {student_name} added with code {student_code}.")
+
+    def draw_qr_rectangle(self, frame, qr_data):
+        cv2.rectangle(frame,
+                      (qr_data.rect.left, qr_data.rect.top),
+                      (qr_data.rect.left + qr_data.rect.width, qr_data.rect.top + qr_data.rect.height),
+                      (0, 255, 0), 3)
+
+
+# RFID Scanner class to handle RFID card scanning
+class RfidScanner:
+    def __init__(self, student_manager):
+        self.reader = SimpleMFRC522()
+        self.student_manager = student_manager
+
+    def scan(self):
+        print("Waiting for RFID scan...")
+        student_code, _ = self.reader.read()
+        print(f"RFID Scanned: {student_code}")
+
+        # Process the scanned student code
+        self.process_rfid_scan(student_code)
+
+    def process_rfid_scan(self, student_code):
+        student_name = self.student_manager.get_student_name(str(student_code))
+
+        if student_name and not self.student_manager.is_student_in_class(str(student_code)):
+            print(f"Student: {student_name} is in the class.")
+            self.student_manager.mark_student_in_class(str(student_code))
+        elif student_name and self.student_manager.is_student_in_class(str(student_code)):
+            print(f"Student: {student_name} is out of the class.")
+            self.student_manager.mark_student_out_class(str(student_code))
+        elif not student_name:
+            self.handle_new_student(str(student_code))
+
+    def handle_new_student(self, student_code):
+        student_name = input(f"Enter student full name for RFID code {student_code}: ")
+        self.student_manager.save_student(student_name, student_code)
+        print(f"New student {student_name} added with RFID code {student_code}.")
+
+
+# Main class to integrate both QR and RFID functionalities
+class Main:
+    def __init__(self):
+        self.student_manager_qr = StudentManager()
+        self.qr_scanner = QrScanner(self.student_manager_qr)
+        self.student_manager_rfid = StudentManagerRFID()
+        self.rfid_scanner = RfidScanner(self.student_manager_rfid)
+
+    def show_menu(self):
+        while True:
+            print("\nMenu:")
+            print("1: Scan card with QR code")
+            print("2: Tap the card with RFID (preferred)")
+            print("3: Check students in class (QR)")
+            print("4: Check RFID students in class")
+            print("0: Exit")
+            choice = input("Enter your choice: ")
+
+            if choice == "1":
+                self.qr_scanner.scan()
+            elif choice == "2":
+                self.rfid_scanner.scan()
+            elif choice == "3":
+                self.student_manager_qr.check_students_in_class()
+            elif choice == "4":
+                self.student_manager_rfid.check_students_in_class()
+            elif choice == "0":
+                print("Exiting program.")
+                break
+            else:
+                print("Invalid choice, please try again.")
+
+    def run(self):
+        self.show_menu()
+
+
+if __name__ == "__main__":
+    main_program = Main()
+    main_program.run()
+
+
